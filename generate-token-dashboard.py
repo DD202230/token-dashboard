@@ -357,11 +357,12 @@ def generate_html(daily, total, model_stats, source_stats):
             continue
         color = source_colors.get(name, "#8b949e")
         pct = round(st / total_tokens * 100) if total_tokens > 0 else 0
+        est_tag = '<span style="font-size:11px;color:var(--text-muted);background:var(--glass);padding:2px 8px;border-radius:6px;margin-left:6px;border:1px solid var(--border);">估算 · 含思维链</span>' if name == "Hermes" else ""
         source_cards.append(f"""
             <div class="source-card" style="--brand:{color}">
                 <div class="source-header">
                     <span class="source-dot" style="background:{color}"></span>
-                    <span class="source-name">{name}</span>
+                    <span class="source-name">{name}</span>{est_tag}
                     <span class="source-pct">{pct}%</span>
                 </div>
                 <div class="source-bar-track">
