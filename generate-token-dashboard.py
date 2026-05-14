@@ -102,7 +102,7 @@ def parse_claude_transcripts():
     files = glob.glob(os.path.expanduser("~/.claude/projects/-Users-dd/*.jsonl"))
     for path in files:
         mtime = os.path.getmtime(path)
-        day = datetime.fromtimestamp(mtime, tz=timezone.utc).strftime("%Y-%m-%d")
+        day = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d")
 
         try:
             with open(path) as f:
@@ -150,7 +150,7 @@ def parse_openclaw_trajectories():
     files = glob.glob(os.path.expanduser("~/.openclaw/agents/main/sessions/*.trajectory.jsonl"))
     for path in files:
         mtime = os.path.getmtime(path)
-        day = datetime.fromtimestamp(mtime, tz=timezone.utc).strftime("%Y-%m-%d")
+        day = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d")
 
         seen_runs = set()
         try:
@@ -207,9 +207,10 @@ def parse_openclaw_trajectories():
 
 
 def estimate_tokens(text):
+    """字符长度估算: 中文 ~2 chars/token, 英文 ~4 chars/token, 混合取 ~2.5"""
     if not text:
         return 0
-    return int(len(text) / 3)
+    return max(1, int(len(text) / 2.5))
 
 
 def parse_hermes_sessions():
@@ -220,7 +221,7 @@ def parse_hermes_sessions():
     files = glob.glob(os.path.expanduser("~/.hermes/sessions/session_*.json"))
     for path in files:
         mtime = os.path.getmtime(path)
-        day = datetime.fromtimestamp(mtime, tz=timezone.utc).strftime("%Y-%m-%d")
+        day = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d")
 
         try:
             with open(path) as f:
@@ -233,33 +234,88 @@ def parse_hermes_sessions():
             continue
 
         model = normalize_model(session.get("model", "hermes"))
-        inp = 0
-        out = 0
-        for msg in messages:
-            role = msg.get("role", "")
-            content = str(msg.get("content", "") or "")
-            reasoning = str(msg.get("reasoning_content", "") or "")
-            text = content + reasoning
-            tokens = estimate_tokens(text)
-            if role == "user":
-                inp += tokens
-            elif role == "assistant":
-                out += tokens
-
-        count = max(1, len([m for m in messages if m.get("role") == "assistant"]))
+        usage = session.get("usage", {})
+        # 优先使用 Hermes 自己记录的 API usage（含缓存）
+        if usage and usage.get("input_tokens") is not None:
+            inp = usage.get("input_tokens", 0)
+            out = usage.get("output_tokens", 0)
+            cr = usage.get("cache_read_tokens", 0)
+            cc = usage.get("cache_write_tokens", 0)
+            count = max(1, usage.get("api_calls", 0) or len([m for m in messages if m.get("role") == "assistant"]))
+        else:
+            # 回退：字符长度估算
+            system_prompt = str(session.get("system_prompt", "") or "")
+            inp = estimate_tokens(system_prompt)
+            out = 0
+            cr = 0
+            cc = 0
+            for msg in messages:
+                role = msg.get("role", "")
+                content = str(msg.get("content", "") or "")
+                reasoning = str(msg.get("reasoning_content", "") or "")
+                # 去重：如果 reasoning 是 content 的子串，只算 content
+                if reasoning and reasoning in content:
+                    text = content
+                elif reasoning:
+                    text = content + reasoning
+                else:
+                    text = content
+                tokens = estimate_tokens(text)
+                if role == "user":
+                    inp += tokens
+                elif role == "assistant":
+                    out += tokens
+            count = max(1, len([m for m in messages if m.get("role") == "assistant"]))
 
         dd = daily.setdefault(day, {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0, "count": 0})
-        for k, v in [("input", inp), ("output", out), ("count", count)]:
+        for k, v in [("input", inp), ("output", out), ("cache_read", cr), ("cache_creation", cc), ("count", count)]:
             dd[k] += v
 
-        for k, v in [("input", inp), ("output", out), ("count", count)]:
+        for k, v in [("input", inp), ("output", out), ("cache_read", cr), ("cache_creation", cc), ("count", count)]:
             total[k] += v
 
         ms = model_stats.setdefault(model, {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0, "count": 0})
-        for k, v in [("input", inp), ("output", out), ("count", count)]:
+        for k, v in [("input", inp), ("output", out), ("cache_read", cr), ("cache_creation", cc), ("count", count)]:
             ms[k] += v
 
     return daily, total, model_stats, {"Hermes": total.copy()}
+
+
+def parse_telegram_usage():
+    daily = {}
+    total = {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0, "count": 0}
+    model_stats = {}
+
+    try:
+        with open("/tmp/telegram-usage.jsonl") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line.strip())
+                except json.JSONDecodeError:
+                    continue
+                ts = entry.get("time", 0)
+                day = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+                model = normalize_model(entry.get("model", "unknown"))
+                inp = entry.get("input", 0)
+                out = entry.get("output", 0)
+                cr = entry.get("cache_read", 0)
+                cc = entry.get("cache_creation", 0)
+                count = 1
+
+                dd = daily.setdefault(day, {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0, "count": 0})
+                for k, v in [("input", inp), ("output", out), ("cache_read", cr), ("cache_creation", cc), ("count", count)]:
+                    dd[k] += v
+
+                for k, v in [("input", inp), ("output", out), ("cache_read", cr), ("cache_creation", cc), ("count", count)]:
+                    total[k] += v
+
+                ms = model_stats.setdefault(model, {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0, "count": 0})
+                for k, v in [("input", inp), ("output", out), ("cache_read", cr), ("cache_creation", cc), ("count", count)]:
+                    ms[k] += v
+    except FileNotFoundError:
+        pass
+
+    return daily, total, model_stats, {"Telegram Bot": total.copy()}
 
 
 # ── 合并 ────────────────────────────────────────────────
@@ -347,8 +403,8 @@ def generate_html(daily, total, model_stats, source_stats):
 
     # 数据源卡片
     source_cards = []
-    source_colors = {"Claude Code": "#f78166", "OpenClaw": "#3fb950", "Hermes": "#a371f7"}
-    for name in ["Claude Code", "OpenClaw", "Hermes"]:
+    source_colors = {"Claude Code": "#f78166", "OpenClaw": "#3fb950", "Hermes": "#a371f7", "Telegram Bot": "#58a6ff"}
+    for name in ["Claude Code", "OpenClaw", "Hermes", "Telegram Bot"]:
         if name not in source_stats:
             continue
         ss = source_stats[name]
@@ -357,12 +413,11 @@ def generate_html(daily, total, model_stats, source_stats):
             continue
         color = source_colors.get(name, "#8b949e")
         pct = round(st / total_tokens * 100) if total_tokens > 0 else 0
-        est_tag = '<span style="font-size:11px;color:var(--text-muted);background:var(--glass);padding:2px 8px;border-radius:6px;margin-left:6px;border:1px solid var(--border);">估算 · 含思维链</span>' if name == "Hermes" else ""
         source_cards.append(f"""
             <div class="source-card" style="--brand:{color}">
                 <div class="source-header">
                     <span class="source-dot" style="background:{color}"></span>
-                    <span class="source-name">{name}</span>{est_tag}
+                    <span class="source-name">{name}</span>
                     <span class="source-pct">{pct}%</span>
                 </div>
                 <div class="source-bar-track">
@@ -879,11 +934,12 @@ def main():
     c_daily, c_total, c_models, c_source = parse_claude_transcripts()
     o_daily, o_total, o_models, o_source = parse_openclaw_trajectories()
     h_daily, h_total, h_models, h_source = parse_hermes_sessions()
+    t_daily, t_total, t_models, t_source = parse_telegram_usage()
 
-    daily = merge_dailies(c_daily, o_daily, h_daily)
-    total = merge_totals(c_total, o_total, h_total)
-    model_stats = merge_model_stats(c_models, o_models, h_models)
-    source_stats = {**c_source, **o_source, **h_source}
+    daily = merge_dailies(c_daily, o_daily, h_daily, t_daily)
+    total = merge_totals(c_total, o_total, h_total, t_total)
+    model_stats = merge_model_stats(c_models, o_models, h_models, t_models)
+    source_stats = {**c_source, **o_source, **h_source, **t_source}
 
     current_hash = hashlib.sha256(json.dumps(total, sort_keys=True).encode()).hexdigest()[:16]
     try:
